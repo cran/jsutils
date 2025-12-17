@@ -1,6 +1,6 @@
 Package: jsutils
 Title: 'JavaScript' Utilities for 'R'
-Version: 0.1.0
+Version: 0.2.0
 Authors@R: 
     person(c("Andrew", "R."), "Johnson", , "andrew.johnson@arjohnsonau.com", role = c("aut", "cre"),
            comment = c(ORCID = "0000-0001-7000-8065"))
@@ -10,11 +10,12 @@ License: MIT + file LICENSE
 Encoding: UTF-8
 RoxygenNote: 7.3.3
 Imports: QuickJSR (>= 1.8.1)
-URL: https://andrjohns.github.io/jsutils/
+URL: https://github.com/andrjohns/QuickJSR,
+        https://andrjohns.github.io/jsutils/
 NeedsCompilation: no
-Packaged: 2025-11-03 08:57:16 UTC; andrew
+Packaged: 2025-12-17 13:12:40 UTC; andrew
 Author: Andrew R. Johnson [aut, cre] (ORCID:
     <https://orcid.org/0000-0001-7000-8065>)
 Maintainer: Andrew R. Johnson <andrew.johnson@arjohnsonau.com>
 Repository: CRAN
-Date/Publication: 2025-11-06 10:00:02 UTC
+Date/Publication: 2025-12-17 13:50:02 UTC
