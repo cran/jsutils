@@ -79,7 +79,7 @@ var terser = (function (exports) {
       for (const i in defs) if (HOP(defs, i)) {
           if (!args || !HOP(args, i)) {
               ret[i] = defs[i];
-          } else if (i === "ecma") {
+          } else if (i === "ecma" || i === "builtins_ecma") {
               let ecma = args[i] | 0;
               if (ecma > 5 && ecma < 2015) ecma += 2009;
               ret[i] = ecma;
@@ -128,6 +128,15 @@ var terser = (function (exports) {
           if (!props.end) props.end = orig.end;
       }
       return new ctor(props);
+  }
+
+  /** Makes a `void 0` expression. Use instead of AST_Undefined which may conflict
+   * with an existing variable called `undefined` */
+  function make_void_0(orig) {
+      return make_node(AST_UnaryPrefix, orig, {
+          operator: "void",
+          expression: make_node(AST_Number, orig, { value: 0 })
+      });
   }
 
   function push_uniq(array, el) {
@@ -2454,12 +2463,20 @@ var terser = (function (exports) {
               ret = _make_symbol(AST_SymbolRef);
               break;
             case "num":
-              ret = new AST_Number({
-                  start: tok,
-                  end: tok,
-                  value: tok.value,
-                  raw: LATEST_RAW
-              });
+              if (tok.value === Infinity) {
+                  // very large float values are parsed as Infinity
+                  ret = new AST_Infinity({
+                      start: tok,
+                      end: tok,
+                  });
+              } else {
+                  ret = new AST_Number({
+                      start: tok,
+                      end: tok,
+                      value: tok.value,
+                      raw: LATEST_RAW
+                  });
+              }
               break;
             case "big_int":
               ret = new AST_BigInt({
@@ -10266,21 +10283,21 @@ var terser = (function (exports) {
 
       PARENS(AST_Sequence, function(output) {
           var p = output.parent();
-          return p instanceof AST_Call                          // (foo, bar)() or foo(1, (2, 3), 4)
-              || p instanceof AST_Unary                         // !(foo, bar, baz)
-              || p instanceof AST_Binary                        // 1 + (2, 3) + 4 ==> 8
-              || p instanceof AST_VarDefLike                    // var a = (1, 2), b = a + a; ==> b == 4
-              || p instanceof AST_PropAccess                    // (1, {foo:2}).foo or (1, {foo:2})["foo"] ==> 2
-              || p instanceof AST_Array                         // [ 1, (2, 3), 4 ] ==> [ 1, 3, 4 ]
-              || p instanceof AST_ObjectProperty                // { foo: (1, 2) }.foo ==> 2
-              || p instanceof AST_Conditional                   /* (false, true) ? (a = 10, b = 20) : (c = 30)
-                                                                 * ==> 20 (side effect, set a := 10 and b := 20) */
-              || p instanceof AST_Arrow                         // x => (x, x)
-              || p instanceof AST_DefaultAssign                 // x => (x = (0, function(){}))
-              || p instanceof AST_Expansion                     // [...(a, b)]
-              || p instanceof AST_ForOf && this === p.object    // for (e of (foo, bar)) {}
-              || p instanceof AST_Yield                         // yield (foo, bar)
-              || p instanceof AST_Export                        // export default (foo, bar)
+          return p instanceof AST_Call                              // (foo, bar)() or foo(1, (2, 3), 4)
+              || p instanceof AST_Unary                             // !(foo, bar, baz)
+              || p instanceof AST_Binary                            // 1 + (2, 3) + 4 ==> 8
+              || p instanceof AST_VarDefLike                        // var a = (1, 2), b = a + a; ==> b == 4
+              || p instanceof AST_PropAccess && this !== p.property // (1, {foo:2}).foo, (1, {foo:2})["foo"], not foo[1, 2]
+              || p instanceof AST_Array                             // [ 1, (2, 3), 4 ] ==> [ 1, 3, 4 ]
+              || p instanceof AST_ObjectProperty                    // { foo: (1, 2) }.foo ==> 2
+              || p instanceof AST_Conditional                       /* (false, true) ? (a = 10, b = 20) : (c = 30)
+                                                                     * ==> 20 (side effect, set a := 10 and b := 20) */
+              || p instanceof AST_Arrow                             // x => (x, x)
+              || p instanceof AST_DefaultAssign                     // x => (x = (0, function(){}))
+              || p instanceof AST_Expansion                         // [...(a, b)]
+              || p instanceof AST_ForOf && this === p.object        // for (e of (foo, bar)) {}
+              || p instanceof AST_Yield                             // yield (foo, bar)
+              || p instanceof AST_Export                            // export default (foo, bar)
           ;
       });
 
@@ -11899,7 +11916,10 @@ var terser = (function (exports) {
   AST_Chain.prototype.shallow_cmp = pass_through;
 
   AST_Dot.prototype.shallow_cmp = function(other) {
-      return this.property === other.property;
+      return (
+          this.property === other.property
+          && !!this.quote === !!other.quote
+      );
   };
 
   AST_DotHash.prototype.shallow_cmp = function(other) {
@@ -12779,6 +12799,7 @@ var terser = (function (exports) {
           if (
               function_defs
               && node instanceof AST_VarDef
+              && node.name instanceof AST_Symbol
               && node.value instanceof AST_Lambda
               && !node.value.name
               && keep_name(options.keep_fnames, node.name.name)
@@ -13563,7 +13584,7 @@ var terser = (function (exports) {
         case "boolean":
           return make_node(val ? AST_True : AST_False, orig);
         case "undefined":
-          return make_node(AST_Undefined, orig);
+          return make_void_0(orig);
         default:
           if (val === null) {
               return make_node(AST_Null, orig, { value: null });
@@ -13837,10 +13858,14 @@ var terser = (function (exports) {
   // Note: Lots of methods and functions are missing here, in case they aren't pure
   // or not available in all JS environments.
 
-  function make_nested_lookup(obj) {
+  const make_nested_lookup = (feature_callback) => (compressor) => {
+      const obj = feature_callback(feature_variables(compressor));
+
       const out = new Map();
       for (var key of Object.keys(obj)) {
-          out.set(key, makePredicate(obj[key]));
+          if (obj[key]) {
+              out.set(key, makePredicate(remove_false(obj[key])));
+          }
       }
 
       const does_have = (global_name, fname) => {
@@ -13848,7 +13873,73 @@ var terser = (function (exports) {
           return inner_map != null && inner_map.has(fname);
       };
       return does_have;
+  };
+
+  const make_lookup = (feature_callback) => (compressor) => {
+      const obj = feature_callback(feature_variables(compressor));
+
+      const predicate = makePredicate(remove_false(obj));
+      const does_have = (global_name) => {
+          return predicate.has(global_name);
+      };
+      return does_have;
+  };
+
+  function remove_false(arr) {
+      for (let i = 0; i < arr.length; i++) {
+          if (arr[i] === false) {
+              arr.splice(i, 1);
+              i--;
+          }
+      }
+      return arr;
   }
+
+  /** Generate the object with arguments seen below */
+  function feature_variables(compressor) {
+      return {
+          sloppy: compressor.option("unsafe"),
+          es: compressor.option("builtins_ecma"),
+      };
+  }
+
+  // eslint-disable-next-line no-unused-vars
+  const pure_access_globals = make_lookup(({ sloppy, es }) => [
+      "Array",
+      "Boolean",
+      "clearInterval",
+      "clearTimeout",
+      "console",
+      "Date",
+      "decodeURI",
+      "decodeURIComponent",
+      "encodeURI",
+      "encodeURIComponent",
+      "Error",
+      "escape",
+      "eval",
+      "EvalError",
+      "Function",
+      es >= 2020 && "globalThis",
+      "isFinite",
+      "isNaN",
+      "JSON",
+      "Math",
+      "Number",
+      "parseFloat",
+      "parseInt",
+      "RangeError",
+      "ReferenceError",
+      "RegExp",
+      "Object",
+      "setInterval",
+      "setTimeout",
+      "String",
+      "SyntaxError",
+      "TypeError",
+      "unescape",
+      "URIError",
+  ]);
 
   // Objects which are safe to access without throwing or causing a side effect.
   // Usually we'd check the `unsafe` option first but these are way too common for that
@@ -13861,17 +13952,90 @@ var terser = (function (exports) {
       "Promise",
   ]);
 
+  // eslint-disable-next-line no-unused-vars
+  const is_pure_native_fn = make_lookup(({ sloppy, es }) => [
+      sloppy && es >= 2021 && "AggregateError",
+      "Array",
+      "ArrayBuffer",
+      es >= 2020 && "BigInt",
+      es >= 2020 && "BigInt64Array",
+      es >= 2020 && "BigUint64Array",
+      "Boolean",
+      "Date",
+      sloppy && "decodeURI",
+      sloppy && "decodeURIComponent",
+      sloppy && "encodeURI",
+      sloppy && "encodeURIComponent",
+      "Error",
+      "escape",
+      "EvalError",
+      es >= 2021 && "FinalizationRegistry",
+      es >= 2026 && "Float16Array",
+      "Float32Array",
+      "Float64Array",
+      "Int16Array",
+      "Int32Array",
+      "Int8Array",
+      "isFinite",
+      "isNaN",
+      es >= 2026 && "Iterator",
+      es >= 2015 && "Map",
+      "Number",
+      "parseFloat",
+      "parseInt",
+      es >= 2015 && "Promise",
+      es >= 2015 && "Proxy",
+      "RangeError",
+      "ReferenceError",
+      sloppy && "RegExp",
+      es >= 2015 && "Set",
+      "String",
+      es >= 2015 && "Symbol",
+      "SyntaxError",
+      "TypeError",
+      "Uint16Array",
+      "Uint32Array",
+      "Uint8Array",
+      "Uint8ClampedArray",
+      sloppy && "unescape",
+      "URIError",
+      sloppy && es >= 2015 && "WeakMap",
+      sloppy && es >= 2021 && "WeakRef",
+      sloppy && es >= 2015 && "WeakSet",
+  ]);
+
+  const arg1_is_iterable = new Set([
+      "Map",
+      "Set",
+      "WeakMap",
+      "WeakSet",
+  ]);
+  const arg1_is_range_or_iterable = new Set([
+      "ArrayBuffer",
+      "Float32Array",
+      "Float64Array",
+      "Int16Array",
+      "Int32Array",
+      "Int8Array",
+      "Uint16Array",
+      "Uint32Array",
+      "Uint8Array",
+      "Uint8ClampedArray",
+  ]);
+  const lone_arg_is_range = new Set(["Array"]);
+
   const object_methods = [
       "constructor",
       "toString",
       "valueOf",
   ];
 
-  const is_pure_native_method = make_nested_lookup({
+  // eslint-disable-next-line no-unused-vars
+  const is_pure_native_method = make_nested_lookup(({ sloppy, es }) => ({
       Array: [
-          "at",
-          "flat",
-          "includes",
+          es >= 2022 && "at",
+          es >= 2019 && "flat",
+          es >= 2016 && "includes",
           "indexOf",
           "join",
           "lastIndexOf",
@@ -13892,90 +14056,160 @@ var terser = (function (exports) {
           ...object_methods,
       ],
       String: [
-          "at",
+          es >= 2022 && "at",
           "charAt",
           "charCodeAt",
-          "charPointAt",
+          es >= 2015 && "codePointAt",
           "concat",
-          "endsWith",
-          "fromCharCode",
-          "fromCodePoint",
-          "includes",
+          es >= 2025 && "endsWith",
+          es >= 2015 && "includes",
           "indexOf",
           "italics",
           "lastIndexOf",
-          "localeCompare",
+          es >= 2020 && "localeCompare",
           "match",
-          "matchAll",
-          "normalize",
-          "padStart",
-          "padEnd",
-          "repeat",
+          es >= 2020 && "matchAll",
+          es >= 2015 && "normalize",
+          es >= 2017 && "padStart",
+          es >= 2017 && "padEnd",
+          es >= 2015 && sloppy && "repeat",
           "replace",
-          "replaceAll",
+          es >= 2021 && "replaceAll",
           "search",
           "slice",
           "split",
-          "startsWith",
+          es >= 2015 && "startsWith",
           "substr",
           "substring",
-          "repeat",
+          es >= 2015 && "repeat",
           "toLocaleLowerCase",
           "toLocaleUpperCase",
           "toLowerCase",
           "toUpperCase",
           "trim",
-          "trimEnd",
-          "trimStart",
+          es >= 2019 && "trimEnd",
+          es >= 2019 && "trimStart",
+          es >= 2019 && "trimLeft",
+          es >= 2019 && "trimRight",
           ...object_methods,
       ],
-  });
+  }));
 
-  const is_pure_native_fn = make_nested_lookup({
+  // eslint-disable-next-line no-unused-vars
+  const is_pure_native_static_fn = make_nested_lookup(({ sloppy, es }) => ({
       Array: [
           "isArray",
+          es >= 2015 && "of",
       ],
+      ArrayBuffer: [
+          "isView",
+      ],
+      BigInt: es >= 2020 && [
+          sloppy && "asIntN",
+          sloppy && "asUintN",
+      ],
+      BigInt64Array: sloppy && es >= 2020 && ["of"],
+      BigUint64Array: sloppy && es >= 2020 && ["of"],
+      Date: [
+          "now",
+          "parse",
+          "UTC",
+      ],
+      Error: [
+          es >= 2026 && "isError",
+      ],
+      Float16Array: sloppy && es >= 2026 && ["of"],
+      Float32Array: sloppy && ["of"],
+      Float64Array: sloppy && ["of"],
+      Int16Array: sloppy && ["of"],
+      Int32Array: sloppy && ["of"],
+      Int8Array: sloppy && ["of"],
       Math: [
           "abs",
           "acos",
+          es >= 2015 && "acosh",
           "asin",
+          es >= 2015 && "asinh",
           "atan",
-          "ceil",
-          "cos",
-          "exp",
-          "floor",
-          "log",
-          "round",
-          "sin",
-          "sqrt",
-          "tan",
           "atan2",
-          "pow",
+          es >= 2015 && "atanh",
+          es >= 2015 && "cbrt",
+          "ceil",
+          es >= 2015 && "clz32",
+          "cos",
+          es >= 2015 && "cosh",
+          "exp",
+          es >= 2015 && "expm1",
+          "floor",
+          es >= 2026 && "f16round",
+          es >= 2015 && "fround",
+          es >= 2015 && "hypot",
+          es >= 2015 && "imul",
+          "log",
+          es >= 2015 && "log10",
+          es >= 2015 && "log1p",
+          es >= 2015 && "log2",
           "max",
           "min",
+          "pow",
+          "round",
+          es >= 2015 && "sign",
+          "sin",
+          es >= 2015 && "sinh",
+          "sqrt",
+          "tan",
+          es >= 2015 && "tanh",
+          es >= 2015 && "trunc",
       ],
       Number: [
-          "isFinite",
-          "isNaN",
+          es >= 2015 && "isFinite",
+          es >= 2015 && "isInteger",
+          es >= 2015 && "isSafeInteger",
+          es >= 2015 && "isNaN",
+          es >= 2015 && "parseFloat",
+          es >= 2015 && "parseInt",
       ],
       Object: [
-          "create",
-          "getOwnPropertyDescriptor",
-          "getOwnPropertyNames",
-          "getPrototypeOf",
+          sloppy && "create",
+          sloppy && "getOwnPropertyDescriptor",
+          es >= 2017 && sloppy && "getOwnPropertyDescriptors",
+          sloppy && "getOwnPropertyNames",
+          es >= 2015 && sloppy && "getOwnPropertySymbols",
+          sloppy && "getPrototypeOf",
+          es >= 2022 && sloppy && "hasOwn",
+          es >= 2015 && "is",
           "isExtensible",
           "isFrozen",
           "isSealed",
-          "hasOwn",
-          "keys",
+          es >= 2015 && sloppy && "keys",
+      ],
+      Promise: es >= 2015 && [
+          es >= 2024 && "withResolvers",
+      ],
+      Proxy: es >= 2015 && [
+          sloppy && "revocable",
+      ],
+      Reflect: es >= 2015 && [
+          sloppy && "has",
+          sloppy && "isExtensible",
+          sloppy && "ownKeys",
+      ],
+      RegExp: [
+          es >= 2026 && sloppy && "escape",
       ],
       String: [
           "fromCharCode",
+          sloppy && es >= 2025 && "fromCodePoint",
       ],
-  });
+      Uint16Array: ["of"],
+      Uint32Array: ["of"],
+      Uint8Array: ["of"],
+      Uint8ClampedArray: ["of"],
+  }));
 
   // Known numeric values which come with JS environments
-  const is_pure_native_value = make_nested_lookup({
+  // eslint-disable-next-line no-unused-vars
+  const is_pure_native_static_property = make_nested_lookup(({ sloppy, es }) => ({
       Math: [
           "E",
           "LN10",
@@ -13987,13 +14221,130 @@ var terser = (function (exports) {
           "SQRT2",
       ],
       Number: [
+          es >= 2015 && "EPSILON",
+          es >= 2015 && "MAX_SAFE_VALUE",
           "MAX_VALUE",
+          es >= 2015 && "MIN_SAFE_VALUE",
           "MIN_VALUE",
           "NaN",
           "NEGATIVE_INFINITY",
           "POSITIVE_INFINITY",
       ],
-  });
+      RegExp: [
+          "$_",
+          "$0",
+          "$1",
+          "$2",
+          "$3",
+          "$4",
+          "$5",
+          "$6",
+          "$7",
+          "$8",
+          "$9",
+          "input",
+          "lastMatch",
+          "lastParen",
+          "leftContext",
+          "rightContext",
+      ],
+  }));
+
+  const re_uppercase_first_letter = /^[A-Z]/;
+  function is_pure_builtin_call(compressor, call) {
+      let builtin = "";
+      let method = "";
+
+      let exp = call.expression;
+      if (is_undeclared_ref(exp)) {
+          builtin = exp.name;
+      } else if (exp instanceof AST_Dot) {
+          method = exp.property;
+
+          exp = exp.expression;
+          if (is_undeclared_ref(exp)) {
+              if (
+                  // globalThis.pureFunc()
+                  exp.name === "globalThis"
+                  && compressor.option("builtins_ecma") >= 2020
+              ) {
+                  builtin = method;
+                  method = "";
+              } else {
+                  // SomeBuiltin.pureFunc()
+                  builtin = exp.name;
+              }
+          } else if (exp instanceof AST_Dot) {
+              if (
+                  is_undeclared_ref(exp.expression)
+                  && exp.expression.name === "globalThis"
+                  && compressor.option("builtins_ecma") >= 2020
+              ) {
+                  // globalThis.SomeBuiltin.pureFunc()
+                  builtin = exp.property;
+              } else {
+                  return false;
+              }
+          } else {
+              return false;
+          }
+      } else {
+          return false;
+      }
+
+      if (!method) {
+          if (compressor.is_pure_native_fn(builtin)) {
+              // some require `new`, others throw if you use it
+              const is_new = call instanceof AST_New;
+              const should_be_new = re_uppercase_first_letter.test(builtin); // true of all `is_pure_native_fn`
+              if (is_new !== should_be_new) return false;
+
+              if (!is_builtin_pure_with_these_args(builtin, call.args)) {
+                  return false;
+              }
+
+              return true;
+          }
+
+          return false;
+      } else {
+          return compressor.is_pure_native_static_fn(builtin, method);
+      }
+  }
+
+  /** Some builtins are listed above but their purity is subject to some conditions */
+  function is_builtin_pure_with_these_args(builtin, args) {
+      // all the builtins we deal with here are ok with getting 0 args
+      if (args.length === 0) return true;
+
+      let arg1 = args[0];
+      if (arg1 instanceof AST_SymbolRef) {
+          arg1 = arg1.fixed_value();
+      }
+
+      if (lone_arg_is_range.has(builtin)) { // new Array(number)
+          const arg_valid = args.length > 1
+              || arg1 instanceof AST_Number
+                  && arg1.value >= 0 && arg1.value <= 0xffffffff;
+              // TODO: or, we are asked to ignore TypeError
+          if (!arg_valid) return false;
+      }
+
+      if (arg1_is_range_or_iterable.has(builtin)) { // new Float32Array(number | Array)
+          const arg_valid = args.length === 0
+              || arg1 instanceof AST_Array
+              || arg1 instanceof AST_Number
+                  && arg1.value >= 0 && arg1.value <= 0xffffffff;
+          if (!arg_valid) return false;
+      }
+
+      if (arg1_is_iterable.has(builtin)) { // new Set(iterable)
+          const arg_valid = args.length === 0 || arg1 instanceof AST_Array;
+          if (!arg_valid) return false;
+      }
+
+      return true;
+  }
 
   /***********************************************************************
 
@@ -14867,21 +15218,20 @@ var terser = (function (exports) {
   AST_Call.DEFMETHOD("is_callee_pure", function(compressor) {
       if (compressor.option("unsafe")) {
           var expr = this.expression;
-          var first_arg = (this.args && this.args[0] && this.args[0].evaluate(compressor));
+          var first_arg;
           if (
               expr.expression && expr.expression.name === "hasOwnProperty" &&
-              (first_arg == null || first_arg.thedef && first_arg.thedef.undeclared)
+              (
+                  (first_arg = (this.args && this.args[0] && this.args[0].evaluate(compressor))) == null
+                  || first_arg.thedef && first_arg.thedef.undeclared
+              )
           ) {
               return false;
           }
           if (is_undeclared_ref(expr) && global_pure_fns.has(expr.name)) return true;
-          if (
-              expr instanceof AST_Dot
-              && is_undeclared_ref(expr.expression)
-              && is_pure_native_fn(expr.expression.name, expr.property)
-          ) {
-              return true;
-          }
+          if (is_pure_builtin_call(compressor, this)) return true;
+      } else if (compressor.option("builtins_pure")) {
+          if (is_pure_builtin_call(compressor, this)) return true;
       }
       if ((this instanceof AST_New) && compressor.option("pure_new")) {
           return true;
@@ -14912,7 +15262,7 @@ var terser = (function (exports) {
       } else if (!this.may_throw_on_access(compressor)) {
           native_obj = "Object";
       }
-      return native_obj != null && is_pure_native_method(native_obj, this.property);
+      return native_obj != null && compressor.is_pure_native_method(native_obj, this.property);
   });
 
   // tell me if a statement aborts
@@ -15374,6 +15724,15 @@ var terser = (function (exports) {
       return value;
   });
 
+  def_eval(AST_Chain, function (compressor, depth) {
+      const evaluated = this.expression._eval(compressor, depth, /*ast_chain=*/true);
+      return evaluated === nullish
+          ? undefined
+          : evaluated === this.expression
+            ? this
+            : evaluated;
+  });
+
   const global_objs = { Array, Math, Number, Object, String };
 
   const regexp_flags = new Set([
@@ -15385,9 +15744,13 @@ var terser = (function (exports) {
       "unicode",
   ]);
 
-  def_eval(AST_PropAccess, function (compressor, depth) {
-      let obj = this.expression._eval(compressor, depth + 1);
-      if (obj === nullish || (this.optional && obj == null)) return nullish;
+  def_eval(AST_PropAccess, function (compressor, depth, ast_chain) {
+      let obj = (ast_chain || this.property === "length" || compressor.option("unsafe"))
+          && this.expression._eval(compressor, depth + 1, ast_chain);
+
+      if (ast_chain) {
+          if (obj === nullish || (this.optional && obj == null)) return nullish;
+      }
 
       // `.length` of strings and arrays is always safe
       if (this.property === "length") {
@@ -15429,7 +15792,7 @@ var terser = (function (exports) {
               if (first_arg == null || first_arg.thedef && first_arg.thedef.undeclared) {
                   return this.clone();
               }
-              if (!is_pure_native_value(exp.name, key))
+              if (!compressor.is_pure_native_static_property(exp.name, key))
                   return this;
               obj = global_objs[exp.name];
           } else {
@@ -15458,26 +15821,19 @@ var terser = (function (exports) {
       return this;
   });
 
-  def_eval(AST_Chain, function (compressor, depth) {
-      const evaluated = this.expression._eval(compressor, depth);
-      return evaluated === nullish
-          ? undefined
-          : evaluated === this.expression
-            ? this
-            : evaluated;
-  });
-
-  def_eval(AST_Call, function (compressor, depth) {
+  def_eval(AST_Call, function (compressor, depth, ast_chain) {
       var exp = this.expression;
 
-      const callee = exp._eval(compressor, depth);
-      if (callee === nullish || (this.optional && callee == null)) return nullish;
+      if (ast_chain) {
+          const callee = exp._eval(compressor, depth, ast_chain);
+          if (callee === nullish || (this.optional && callee == null)) return nullish;
+      }
 
       if (compressor.option("unsafe") && exp instanceof AST_PropAccess) {
           var key = exp.property;
           if (key instanceof AST_Node) {
               key = key._eval(compressor, depth);
-              if (key === exp.property)
+              if (typeof key !== "string" && typeof key !== "number")
                   return this;
           }
           var val;
@@ -15492,13 +15848,14 @@ var terser = (function (exports) {
               if ((first_arg == null || first_arg.thedef && first_arg.thedef.undeclared)) {
                   return this.clone();
               }
-              if (!is_pure_native_fn(e.name, key)) return this;
+              if (!compressor.is_pure_native_static_fn(e.name, key)) return this;
               val = global_objs[e.name];
           } else {
-              val = e._eval(compressor, depth + 1);
+              val = e._eval(compressor, depth + 1, /* don't pass ast_chain (exponential work) */);
+
               if (val === e || !val)
                   return this;
-              if (!is_pure_native_method(val.constructor.name, key))
+              if (!compressor.is_pure_native_method(val.constructor.name, key))
                   return this;
           }
           var args = [];
@@ -15791,8 +16148,8 @@ var terser = (function (exports) {
       AST_ConciseMethod,
       AST_ObjectGetter,
       AST_ObjectSetter,
-  ], function () {
-      return this.computed_key() ? this.key : null;
+  ], function (compressor, first_in_statement) {
+      return this.computed_key() ? this.key.drop_side_effect_free(compressor, first_in_statement) : null;
   });
 
   def_drop_side_effect_free([
@@ -16015,6 +16372,7 @@ var terser = (function (exports) {
           return scan_ref_scoped(node, descend);
       });
       self.walk(tw);
+
       // pass 2: for every used symbol we need to walk its
       // initialization code to figure out if it uses other
       // symbols (that may not be in_use).
@@ -16025,6 +16383,7 @@ var terser = (function (exports) {
               init.walk(tw);
           });
       });
+
       // pass 3: we should drop declarations not in_use
       var tt = new TreeTransformer(
           function before(node, descend, in_list) {
@@ -16419,7 +16778,7 @@ var terser = (function (exports) {
           if (def.fixed == null) {
               var orig = def.orig[0];
               if (orig instanceof AST_SymbolFunarg || orig.name == "arguments") return false;
-              def.fixed = make_node(AST_Undefined, orig);
+              def.fixed = make_void_0(orig);
           }
           return true;
       }
@@ -16717,7 +17076,7 @@ var terser = (function (exports) {
               if (d.orig.length > 1) return;
               if (d.fixed === undefined && (!this.uses_arguments || tw.has_directive("use strict"))) {
                   d.fixed = function() {
-                      return iife.args[i] || make_node(AST_Undefined, iife);
+                      return iife.args[i] || make_void_0(iife);
                   };
                   tw.loop_ids.set(d.id, tw.in_loop);
                   mark(tw, d, true);
@@ -17642,7 +18001,7 @@ var terser = (function (exports) {
                           }
                       } else {
                           if (!arg) {
-                              arg = make_node(AST_Undefined, sym).transform(compressor);
+                              arg = make_void_0(sym).transform(compressor);
                           } else if (arg instanceof AST_Lambda && arg.pinned()
                               || has_overlapping_symbol(fn, arg, fn_strict)) {
                               arg = null;
@@ -17882,7 +18241,7 @@ var terser = (function (exports) {
                       found = true;
                       if (node instanceof AST_VarDef) {
                           node.value = node.name instanceof AST_SymbolConst
-                              ? make_node(AST_Undefined, node.value) // `const` always needs value.
+                              ? make_void_0(node.value) // `const` always needs value.
                               : null;
                           return node;
                       }
@@ -18321,7 +18680,7 @@ var terser = (function (exports) {
               var stat = statements[i];
               if (prev) {
                   if (stat instanceof AST_Exit) {
-                      stat.value = cons_seq(stat.value || make_node(AST_Undefined, stat).transform(compressor));
+                      stat.value = cons_seq(stat.value || make_void_0(stat).transform(compressor));
                   } else if (stat instanceof AST_For) {
                       if (!(stat.init instanceof AST_DefinitionsLike)) {
                           const abort = walk(prev.body, node => {
@@ -18826,7 +19185,7 @@ var terser = (function (exports) {
               if (returned) {
                   returned = returned.clone(true);
               } else {
-                  returned = make_node(AST_Undefined, self);
+                  returned = make_void_0(self);
               }
               const args = self.args.concat(returned);
               return make_sequence(self, args).optimize(compressor);
@@ -18842,7 +19201,7 @@ var terser = (function (exports) {
               && returned.name === fn.argnames[0].name
           ) {
               const replacement =
-                  (self.args[0] || make_node(AST_Undefined)).optimize(compressor);
+                  (self.args[0] || make_void_0()).optimize(compressor);
 
               let parent;
               if (
@@ -18924,7 +19283,7 @@ var terser = (function (exports) {
 
       const can_drop_this_call = is_regular_func && compressor.option("side_effects") && fn.body.every(is_empty);
       if (can_drop_this_call) {
-          var args = self.args.concat(make_node(AST_Undefined, self));
+          var args = self.args.concat(make_void_0(self));
           return make_sequence(self, args).optimize(compressor);
       }
 
@@ -18943,9 +19302,9 @@ var terser = (function (exports) {
       return self;
 
       function return_value(stat) {
-          if (!stat) return make_node(AST_Undefined, self);
+          if (!stat) return make_void_0(self);
           if (stat instanceof AST_Return) {
-              if (!stat.value) return make_node(AST_Undefined, self);
+              if (!stat.value) return make_void_0(self);
               return stat.value.clone(true);
           }
           if (stat instanceof AST_SimpleStatement) {
@@ -19091,7 +19450,7 @@ var terser = (function (exports) {
               } else {
                   var symbol = make_node(AST_SymbolVar, name, name);
                   name.definition().orig.push(symbol);
-                  if (!value && in_loop) value = make_node(AST_Undefined, self);
+                  if (!value && in_loop) value = make_void_0(self);
                   append_var(decls, expressions, symbol, value);
               }
           }
@@ -19118,7 +19477,7 @@ var terser = (function (exports) {
                           operator: "=",
                           logical: false,
                           left: sym,
-                          right: make_node(AST_Undefined, name)
+                          right: make_void_0(name),
                       }));
                   }
               }
@@ -19288,6 +19647,8 @@ var terser = (function (exports) {
               drop_console  : false,
               drop_debugger : !false_by_default,
               ecma          : 5,
+              builtins_ecma : 5,
+              builtins_pure : false,
               evaluate      : !false_by_default,
               expression    : false,
               global_defs   : false,
@@ -19383,6 +19744,12 @@ var terser = (function (exports) {
           this._mangle_options = mangle_options
               ? format_mangler_options(mangle_options)
               : mangle_options;
+
+          this.pure_access_globals = pure_access_globals(this);
+          this.is_pure_native_fn = is_pure_native_fn(this);
+          this.is_pure_native_method = is_pure_native_method(this);
+          this.is_pure_native_static_fn = is_pure_native_static_fn(this);
+          this.is_pure_native_static_property = is_pure_native_static_property(this);
       }
 
       mangle_options() {
@@ -19616,7 +19983,7 @@ var terser = (function (exports) {
                   set_flag(exp.expression, SQUEEZED);
                   self.args = [];
               } else {
-                  return make_node(AST_Undefined, self);
+                  return make_void_0(self);
               }
           }
       });
@@ -19644,12 +20011,7 @@ var terser = (function (exports) {
                       : make_node(AST_EmptyStatement, node);
               }
               return make_node(AST_SimpleStatement, node, {
-                  body: node.value || make_node(AST_UnaryPrefix, node, {
-                      operator: "void",
-                      expression: make_node(AST_Number, node, {
-                          value: 0
-                      })
-                  })
+                  body: node.value || make_void_0(node)
               });
           }
           if (node instanceof AST_Class || node instanceof AST_Lambda && node !== self) {
@@ -19722,10 +20084,9 @@ var terser = (function (exports) {
       return scope.find_variable(name);
   }
 
-  var global_names = makePredicate("Array Boolean clearInterval clearTimeout console Date decodeURI decodeURIComponent encodeURI encodeURIComponent Error escape eval EvalError Function isFinite isNaN JSON Math Number parseFloat parseInt RangeError ReferenceError RegExp Object setInterval setTimeout String SyntaxError TypeError unescape URIError");
   AST_SymbolRef.DEFMETHOD("is_declared", function(compressor) {
       return !this.definition().undeclared
-          || compressor.option("unsafe") && global_names.has(this.name);
+          || (compressor.option("unsafe") || compressor.option("builtins_pure")) && compressor.pure_access_globals(this.name);
   });
 
   /* -----[ optimizers ]----- */
@@ -20252,8 +20613,8 @@ var terser = (function (exports) {
           return make_node(self.body.CTOR, self, {
               value: make_node(AST_Conditional, self, {
                   condition   : self.condition,
-                  consequent  : self.body.value || make_node(AST_Undefined, self.body),
-                  alternative : self.alternative.value || make_node(AST_Undefined, self.alternative)
+                  consequent  : self.body.value || make_void_0(self.body),
+                  alternative : self.alternative.value || make_void_0(self.alternative),
               }).transform(compressor)
           }).optimize(compressor);
       }
@@ -20806,7 +21167,7 @@ var terser = (function (exports) {
               const value = condition.evaluate(compressor);
       
               if (value === 1 || value === true) {
-                  return make_node(AST_Undefined, self);
+                  return make_void_0(self).optimize(compressor);
               }
           }
       }    
@@ -21168,6 +21529,10 @@ var terser = (function (exports) {
       ) {
           return make_sequence(self, [e, make_node(AST_True, self)]).optimize(compressor);
       }
+      // Short-circuit common `void 0`
+      if (self.operator === "void" && e instanceof AST_Number && e.value === 0) {
+          return unsafe_undefined_ref(self, compressor) || self;
+      }
       var seq = self.lift_sequences(compressor);
       if (seq !== self) {
           return seq;
@@ -21178,7 +21543,7 @@ var terser = (function (exports) {
               self.expression = e;
               return self;
           } else {
-              return make_node(AST_Undefined, self).optimize(compressor);
+              return make_void_0(self).optimize(compressor);
           }
       }
       if (compressor.in_boolean_context()) {
@@ -21364,7 +21729,7 @@ var terser = (function (exports) {
               if (expr instanceof AST_SymbolRef ? expr.is_declared(compressor)
                   : !(expr instanceof AST_PropAccess && compressor.option("ie8"))) {
                   self.right = expr;
-                  self.left = make_node(AST_Undefined, self.left).optimize(compressor);
+                  self.left = make_void_0(self.left).optimize(compressor);
                   if (self.operator.length == 2) self.operator += "=";
               }
           } else if (compressor.option("typeofs")
@@ -21377,7 +21742,7 @@ var terser = (function (exports) {
               if (expr instanceof AST_SymbolRef ? expr.is_declared(compressor)
                   : !(expr instanceof AST_PropAccess && compressor.option("ie8"))) {
                   self.left = expr;
-                  self.right = make_node(AST_Undefined, self.right).optimize(compressor);
+                  self.right = make_void_0(self.right).optimize(compressor);
                   if (self.operator.length == 2) self.operator += "=";
               }
           } else if (self.left instanceof AST_SymbolRef
@@ -22018,7 +22383,8 @@ var terser = (function (exports) {
       return lhs instanceof AST_SymbolRef || lhs.TYPE === self.TYPE;
   }
 
-  def_optimize(AST_Undefined, function(self, compressor) {
+  /** Apply the `unsafe_undefined` option: find a variable called `undefined` and turn `self` into a reference to it. */
+  function unsafe_undefined_ref(self, compressor) {
       if (compressor.option("unsafe_undefined")) {
           var undef = find_variable(compressor, "undefined");
           if (undef) {
@@ -22031,14 +22397,15 @@ var terser = (function (exports) {
               return ref;
           }
       }
+      return null;
+  }
+
+  def_optimize(AST_Undefined, function(self, compressor) {
+      var symbolref = unsafe_undefined_ref(self, compressor);
+      if (symbolref) return symbolref;
       var lhs = compressor.is_lhs();
       if (lhs && is_atomic(lhs, self)) return self;
-      return make_node(AST_UnaryPrefix, self, {
-          operator: "void",
-          expression: make_node(AST_Number, self, {
-              value: 0
-          })
-      });
+      return make_void_0(self);
   });
 
   def_optimize(AST_Infinity, function(self, compressor) {
@@ -22725,7 +23092,7 @@ var terser = (function (exports) {
                   }
               }
               if (retValue instanceof AST_Expansion) break FLATTEN;
-              retValue = retValue instanceof AST_Hole ? make_node(AST_Undefined, retValue) : retValue;
+              retValue = retValue instanceof AST_Hole ? make_void_0(retValue) : retValue;
               if (!flatten) values.unshift(retValue);
               while (--i >= 0) {
                   var value = elements[i];
@@ -22764,7 +23131,7 @@ var terser = (function (exports) {
           if (parent instanceof AST_UnaryPrefix && parent.operator === "delete") {
               return make_node_from_constant(0, self);
           }
-          return make_node(AST_Undefined, self);
+          return make_void_0(self).optimize(compressor);
       }
       if (
           self.expression instanceof AST_PropAccess
@@ -24662,6 +25029,7 @@ var terser = (function (exports) {
       "Array",
       "ArrayBuffer",
       "ArrayType",
+      "AsyncDisposableStack",
       "Atomics",
       "Attr",
       "Audio",
@@ -24800,6 +25168,7 @@ var terser = (function (exports) {
       "COPY_WRITE_BUFFER",
       "COPY_WRITE_BUFFER_BINDING",
       "COUNTER_STYLE_RULE",
+      "CSPViolationReportBody",
       "CSS",
       "CSS2Properties",
       "CSSAnimation",
@@ -24810,6 +25179,9 @@ var terser = (function (exports) {
       "CSSFontFaceRule",
       "CSSFontFeatureValuesRule",
       "CSSFontPaletteValuesRule",
+      "CSSFunctionDeclarations",
+      "CSSFunctionDescriptors",
+      "CSSFunctionRule",
       "CSSGroupingRule",
       "CSSImageValue",
       "CSSImportRule",
@@ -24853,6 +25225,7 @@ var terser = (function (exports) {
       "CSSSkewY",
       "CSSStartingStyleRule",
       "CSSStyleDeclaration",
+      "CSSStyleProperties",
       "CSSStyleRule",
       "CSSStyleSheet",
       "CSSStyleValue",
@@ -24986,6 +25359,7 @@ var terser = (function (exports) {
       "CookieStoreManager",
       "CountQueuingStrategy",
       "Counter",
+      "CreateMonitor",
       "CreateType",
       "Credential",
       "CredentialsContainer",
@@ -25495,11 +25869,14 @@ var terser = (function (exports) {
       "DeviceMotionEventAcceleration",
       "DeviceMotionEventRotationRate",
       "DeviceOrientationEvent",
+      "DevicePosture",
       "DeviceProximityEvent",
       "DeviceStorage",
       "DeviceStorageChangeEvent",
+      "DigitalCredential",
       "Directory",
       "DisplayNames",
+      "DisposableStack",
       "Document",
       "DocumentFragment",
       "DocumentPictureInPicture",
@@ -25507,6 +25884,7 @@ var terser = (function (exports) {
       "DocumentTimeline",
       "DocumentType",
       "DragEvent",
+      "Duration",
       "DurationFormat",
       "DynamicsCompressorNode",
       "E",
@@ -25614,6 +25992,7 @@ var terser = (function (exports) {
       "FeedEntry",
       "Fence",
       "FencedFrameConfig",
+      "FetchLaterResult",
       "File",
       "FileError",
       "FileList",
@@ -25626,6 +26005,7 @@ var terser = (function (exports) {
       "FileSystemFileEntry",
       "FileSystemFileHandle",
       "FileSystemHandle",
+      "FileSystemObserver",
       "FileSystemWritableFileStream",
       "FinalizationRegistry",
       "FindInPage",
@@ -25791,6 +26171,7 @@ var terser = (function (exports) {
       "HTMLQuoteElement",
       "HTMLScriptElement",
       "HTMLSelectElement",
+      "HTMLSelectedContentElement",
       "HTMLShadowElement",
       "HTMLSlotElement",
       "HTMLSourceElement",
@@ -25835,6 +26216,7 @@ var terser = (function (exports) {
       "IDBMutableFile",
       "IDBObjectStore",
       "IDBOpenDBRequest",
+      "IDBRecord",
       "IDBRequest",
       "IDBTransaction",
       "IDBVersionChangeEvent",
@@ -25897,10 +26279,13 @@ var terser = (function (exports) {
       "InstallTrigger",
       "InstallTriggerImpl",
       "Instance",
+      "Instant",
       "Int16Array",
       "Int32Array",
       "Int8Array",
+      "IntegrityViolationReportBody",
       "Intent",
+      "InterestEvent",
       "InternalError",
       "IntersectionObserver",
       "IntersectionObserverEntry",
@@ -25950,6 +26335,7 @@ var terser = (function (exports) {
       "LUMINANCE",
       "LUMINANCE_ALPHA",
       "LanguageCode",
+      "LanguageDetector",
       "LargestContentfulPaint",
       "LaunchParams",
       "LaunchQueue",
@@ -26279,6 +26665,7 @@ var terser = (function (exports) {
       "NavigationCurrentEntryChangeEvent",
       "NavigationDestination",
       "NavigationHistoryEntry",
+      "NavigationPrecommitController",
       "NavigationPreloadManager",
       "NavigationTransition",
       "Navigator",
@@ -26296,6 +26683,7 @@ var terser = (function (exports) {
       "Notation",
       "Notification",
       "NotifyPaintEvent",
+      "Now",
       "Number",
       "NumberFormat",
       "OBJECT_TYPE",
@@ -26317,6 +26705,7 @@ var terser = (function (exports) {
       "OTPCredential",
       "OUT_OF_MEMORY",
       "Object",
+      "Observable",
       "OfflineAudioCompletionEvent",
       "OfflineAudioContext",
       "OfflineResourceList",
@@ -26418,6 +26807,11 @@ var terser = (function (exports) {
       "PhotoCapabilities",
       "PictureInPictureEvent",
       "PictureInPictureWindow",
+      "PlainDate",
+      "PlainDateTime",
+      "PlainMonthDay",
+      "PlainTime",
+      "PlainYearMonth",
       "PlatformArch",
       "PlatformInfo",
       "PlatformNaclArch",
@@ -26458,6 +26852,7 @@ var terser = (function (exports) {
       "QUOTA_ERR",
       "QUOTA_EXCEEDED_ERR",
       "QueryInterface",
+      "QuotaExceededError",
       "R11F_G11F_B10F",
       "R16F",
       "R16I",
@@ -26598,6 +26993,7 @@ var terser = (function (exports) {
       "ResizeObserverEntry",
       "ResizeObserverSize",
       "Response",
+      "RestrictionTarget",
       "RuntimeError",
       "SAMPLER_2D",
       "SAMPLER_2D_ARRAY",
@@ -27004,6 +27400,11 @@ var terser = (function (exports) {
       "ShadowRoot",
       "SharedArrayBuffer",
       "SharedStorage",
+      "SharedStorageAppendMethod",
+      "SharedStorageClearMethod",
+      "SharedStorageDeleteMethod",
+      "SharedStorageModifierMethod",
+      "SharedStorageSetMethod",
       "SharedStorageWorklet",
       "SharedWorker",
       "SharingState",
@@ -27011,6 +27412,12 @@ var terser = (function (exports) {
       "SnapEvent",
       "SourceBuffer",
       "SourceBufferList",
+      "SpeechGrammar",
+      "SpeechGrammarList",
+      "SpeechRecognition",
+      "SpeechRecognitionErrorEvent",
+      "SpeechRecognitionEvent",
+      "SpeechRecognitionPhrase",
       "SpeechSynthesis",
       "SpeechSynthesisErrorEvent",
       "SpeechSynthesisEvent",
@@ -27031,7 +27438,12 @@ var terser = (function (exports) {
       "StyleSheet",
       "StyleSheetList",
       "SubmitEvent",
+      "Subscriber",
       "SubtleCrypto",
+      "Summarizer",
+      "SuppressedError",
+      "SuspendError",
+      "Suspending",
       "Symbol",
       "SyncManager",
       "SyntaxError",
@@ -27142,6 +27554,7 @@ var terser = (function (exports) {
       "TaskController",
       "TaskPriorityChangeEvent",
       "TaskSignal",
+      "Temporal",
       "Text",
       "TextDecoder",
       "TextDecoderStream",
@@ -27166,6 +27579,7 @@ var terser = (function (exports) {
       "TransformStream",
       "TransformStreamDefaultController",
       "TransitionEvent",
+      "Translator",
       "TreeWalker",
       "TrustedHTML",
       "TrustedScript",
@@ -27310,6 +27724,7 @@ var terser = (function (exports) {
       "ViewTransition",
       "ViewTransitionTypeSet",
       "ViewType",
+      "Viewport",
       "VirtualKeyboard",
       "VirtualKeyboardGeometryChangeEvent",
       "VisibilityStateEntry",
@@ -27519,6 +27934,7 @@ var terser = (function (exports) {
       "XRWebGLLayer",
       "XSLTProcessor",
       "ZERO",
+      "ZonedDateTime",
       "ZoomSettings",
       "ZoomSettingsMode",
       "ZoomSettingsScope",
@@ -27568,6 +27984,7 @@ var terser = (function (exports) {
       "activeSourceCount",
       "activeTexture",
       "activeVRDisplays",
+      "activeViewTransition",
       "activityLog",
       "actualBoundingBoxAscent",
       "actualBoundingBoxDescent",
@@ -27575,6 +27992,7 @@ var terser = (function (exports) {
       "actualBoundingBoxRight",
       "adAuctionComponents",
       "adAuctionHeaders",
+      "adapterInfo",
       "add",
       "addAll",
       "addBehavior",
@@ -27600,6 +28018,7 @@ var terser = (function (exports) {
       "addSearchEngine",
       "addSourceBuffer",
       "addStream",
+      "addTeardown",
       "addTextTrack",
       "addTrack",
       "addTransceiver",
@@ -27614,6 +28033,7 @@ var terser = (function (exports) {
       "addressModeU",
       "addressModeV",
       "addressModeW",
+      "adopt",
       "adoptNode",
       "adoptedCallback",
       "adoptedStyleSheets",
@@ -27661,8 +28081,10 @@ var terser = (function (exports) {
       "amplitude",
       "ancestorOrigins",
       "anchor",
+      "anchorName",
       "anchorNode",
       "anchorOffset",
+      "anchorScope",
       "anchorSpace",
       "anchors",
       "and",
@@ -27698,6 +28120,7 @@ var terser = (function (exports) {
       "animationTimingFunction",
       "animationsPaused",
       "anniversary",
+      "annotation",
       "antialias",
       "anticipatedRemoval",
       "any",
@@ -27732,6 +28155,7 @@ var terser = (function (exports) {
       "archive",
       "areas",
       "arguments",
+      "ariaActiveDescendantElement",
       "ariaAtomic",
       "ariaAutoComplete",
       "ariaBrailleLabel",
@@ -27742,21 +28166,29 @@ var terser = (function (exports) {
       "ariaColIndex",
       "ariaColIndexText",
       "ariaColSpan",
+      "ariaControlsElements",
       "ariaCurrent",
+      "ariaDescribedByElements",
       "ariaDescription",
+      "ariaDetailsElements",
       "ariaDisabled",
+      "ariaErrorMessageElements",
       "ariaExpanded",
+      "ariaFlowToElements",
       "ariaHasPopup",
       "ariaHidden",
       "ariaInvalid",
       "ariaKeyShortcuts",
       "ariaLabel",
+      "ariaLabelledByElements",
       "ariaLevel",
       "ariaLive",
       "ariaModal",
       "ariaMultiLine",
       "ariaMultiSelectable",
+      "ariaNotify",
       "ariaOrientation",
+      "ariaOwnsElements",
       "ariaPlaceholder",
       "ariaPosInSet",
       "ariaPressed",
@@ -27899,6 +28331,7 @@ var terser = (function (exports) {
       "baseline-source",
       "baselineShift",
       "baselineSource",
+      "batchUpdate",
       "battery",
       "bday",
       "before",
@@ -27951,6 +28384,7 @@ var terser = (function (exports) {
       "blockDirection",
       "blockSize",
       "blockedURI",
+      "blockedURL",
       "blocking",
       "blockingDuration",
       "blue",
@@ -27961,6 +28395,7 @@ var terser = (function (exports) {
       "bold",
       "bookmarks",
       "booleanValue",
+      "boost",
       "border",
       "border-block",
       "border-block-color",
@@ -28142,6 +28577,7 @@ var terser = (function (exports) {
       "c",
       "cache",
       "caches",
+      "calendar",
       "call",
       "caller",
       "camera",
@@ -28196,6 +28632,7 @@ var terser = (function (exports) {
       "cast",
       "catch",
       "category",
+      "cause",
       "cbrt",
       "cd",
       "ceil",
@@ -28226,6 +28663,7 @@ var terser = (function (exports) {
       "characterData",
       "characterDataOldValue",
       "characterSet",
+      "characterVariant",
       "characteristic",
       "charging",
       "chargingTime",
@@ -28312,6 +28750,7 @@ var terser = (function (exports) {
       "closeCode",
       "closePath",
       "closed",
+      "closedBy",
       "closest",
       "clz",
       "clz32",
@@ -28369,11 +28808,13 @@ var terser = (function (exports) {
       "columnWidth",
       "columns",
       "command",
+      "commandForElement",
       "commands",
       "commit",
       "commitLoadTime",
       "commitPreferences",
       "commitStyles",
+      "committed",
       "commonAncestorContainer",
       "compact",
       "compare",
@@ -28409,6 +28850,7 @@ var terser = (function (exports) {
       "coneOuterAngle",
       "coneOuterGain",
       "config",
+      "configURL",
       "configurable",
       "configuration",
       "configurationName",
@@ -28427,6 +28869,7 @@ var terser = (function (exports) {
       "connectStart",
       "connected",
       "connectedCallback",
+      "connectedMoveCallback",
       "connection",
       "connectionInfo",
       "connectionList",
@@ -28467,6 +28910,7 @@ var terser = (function (exports) {
       "contentBoxSize",
       "contentDocument",
       "contentEditable",
+      "contentEncoding",
       "contentHint",
       "contentOverflow",
       "contentRect",
@@ -28733,7 +29177,11 @@ var terser = (function (exports) {
       "databases",
       "datagrams",
       "dataset",
+      "dateStyle",
       "dateTime",
+      "day",
+      "dayPeriod",
+      "days",
       "db",
       "debug",
       "debuggerEnabled",
@@ -28747,6 +29195,7 @@ var terser = (function (exports) {
       "decodedBodySize",
       "decoding",
       "decodingInfo",
+      "decreaseZoomLevel",
       "decrypt",
       "default",
       "defaultCharset",
@@ -28817,6 +29266,7 @@ var terser = (function (exports) {
       "deprecatedReplaceInURN",
       "deprecatedRunAdAuctionEnforcesKAnonymity",
       "deprecatedURNToURL",
+      "depthActive",
       "depthBias",
       "depthBiasClamp",
       "depthBiasSlopeScale",
@@ -28836,6 +29286,7 @@ var terser = (function (exports) {
       "depthStencilAttachment",
       "depthStencilFormat",
       "depthStoreOp",
+      "depthType",
       "depthUsage",
       "depthWriteEnabled",
       "deref",
@@ -28864,6 +29315,7 @@ var terser = (function (exports) {
       "deviceMemory",
       "devicePixelContentBoxSize",
       "devicePixelRatio",
+      "devicePosture",
       "deviceProtocol",
       "deviceSubclass",
       "deviceVersionMajor",
@@ -28903,6 +29355,8 @@ var terser = (function (exports) {
       "displayName",
       "displayWidth",
       "dispose",
+      "disposeAsync",
+      "disposed",
       "disposition",
       "distanceModel",
       "div",
@@ -28924,6 +29378,7 @@ var terser = (function (exports) {
       "documentOrigins",
       "documentPictureInPicture",
       "documentURI",
+      "documentURL",
       "documentUrl",
       "documentUrls",
       "dolphin",
@@ -29079,6 +29534,7 @@ var terser = (function (exports) {
       "enumerateEditable",
       "environmentBlendMode",
       "equals",
+      "era",
       "error",
       "errorCode",
       "errorDetail",
@@ -29110,7 +29566,9 @@ var terser = (function (exports) {
       "expandEntityReferences",
       "expando",
       "expansion",
+      "expectedContextLanguages",
       "expectedImprovement",
+      "expectedInputLanguages",
       "experiments",
       "expiration",
       "expirationTime",
@@ -29153,6 +29611,7 @@ var terser = (function (exports) {
       "fence",
       "fenceSync",
       "fetch",
+      "fetchLater",
       "fetchPriority",
       "fetchStart",
       "fftSize",
@@ -29184,6 +29643,7 @@ var terser = (function (exports) {
       "filterResY",
       "filterUnits",
       "filters",
+      "finalResponseHeadersStart",
       "finally",
       "find",
       "findIndex",
@@ -29197,6 +29657,7 @@ var terser = (function (exports) {
       "finished",
       "fireEvent",
       "firesTouchEvents",
+      "first",
       "firstChild",
       "firstElementChild",
       "firstInterimResponseStart",
@@ -29221,6 +29682,7 @@ var terser = (function (exports) {
       "flexGrow",
       "flexShrink",
       "flexWrap",
+      "flip",
       "flipX",
       "flipY",
       "float",
@@ -29282,6 +29744,7 @@ var terser = (function (exports) {
       "fontVariantAlternates",
       "fontVariantCaps",
       "fontVariantEastAsian",
+      "fontVariantEmoji",
       "fontVariantLigatures",
       "fontVariantNumeric",
       "fontVariantPosition",
@@ -29311,11 +29774,13 @@ var terser = (function (exports) {
       "formatToParts",
       "forms",
       "forward",
+      "forwardWheel",
       "forwardX",
       "forwardY",
       "forwardZ",
       "foundation",
       "fr",
+      "fractionalSecondDigits",
       "fragment",
       "fragmentDirective",
       "frame",
@@ -29387,6 +29852,7 @@ var terser = (function (exports) {
       "getAdjacentText",
       "getAll",
       "getAllKeys",
+      "getAllRecords",
       "getAllResponseHeaders",
       "getAllowlistForFeature",
       "getAnimations",
@@ -29435,11 +29901,13 @@ var terser = (function (exports) {
       "getCharNumAtPosition",
       "getCharacteristic",
       "getCharacteristics",
+      "getClientCapabilities",
       "getClientExtensionResults",
       "getClientRect",
       "getClientRects",
       "getCoalescedEvents",
       "getCompilationInfo",
+      "getComposedRanges",
       "getCompositionAlternatives",
       "getComputedStyle",
       "getComputedTextLength",
@@ -29563,6 +30031,8 @@ var terser = (function (exports) {
       "getNotifier",
       "getNumberOfChars",
       "getOffsetReferenceSpace",
+      "getOrInsert",
+      "getOrInsertComputed",
       "getOutputTimestamp",
       "getOverrideHistoryNavigationMode",
       "getOverrideStyle",
@@ -29574,7 +30044,9 @@ var terser = (function (exports) {
       "getParameter",
       "getParameters",
       "getParent",
+      "getPathData",
       "getPathSegAtLength",
+      "getPathSegmentAtLength",
       "getPermissionWarningsByManifest",
       "getPhotoCapabilities",
       "getPhotoSettings",
@@ -29656,6 +30128,7 @@ var terser = (function (exports) {
       "getSupportedConstraints",
       "getSupportedExtensions",
       "getSupportedFormats",
+      "getSupportedZoomLevels",
       "getSyncParameter",
       "getSynchronizationSources",
       "getTags",
@@ -29828,6 +30301,7 @@ var terser = (function (exports) {
       "highWaterMark",
       "highlight",
       "highlights",
+      "highlightsFromPoint",
       "hint",
       "hints",
       "history",
@@ -29837,6 +30311,10 @@ var terser = (function (exports) {
       "host",
       "hostCandidate",
       "hostname",
+      "hour",
+      "hour12",
+      "hourCycle",
+      "hours",
       "href",
       "hrefTranslate",
       "hreflang",
@@ -29849,6 +30327,7 @@ var terser = (function (exports) {
       "hwTimestamp",
       "hyphenate-character",
       "hyphenateCharacter",
+      "hyphenateLimitChars",
       "hyphens",
       "hypot",
       "i18n",
@@ -29902,6 +30381,7 @@ var terser = (function (exports) {
       "incomingHighWaterMark",
       "incomingMaxAge",
       "incomingUnidirectionalStreams",
+      "increaseZoomLevel",
       "incremental",
       "indeterminate",
       "index",
@@ -29979,6 +30459,7 @@ var terser = (function (exports) {
       "inputEncoding",
       "inputMethod",
       "inputMode",
+      "inputQuota",
       "inputSource",
       "inputSources",
       "inputType",
@@ -30008,6 +30489,7 @@ var terser = (function (exports) {
       "insetInline",
       "insetInlineEnd",
       "insetInlineStart",
+      "inspect",
       "install",
       "installing",
       "instanceRoot",
@@ -30018,9 +30500,11 @@ var terser = (function (exports) {
       "int32",
       "int8",
       "integrity",
+      "interactionCount",
       "interactionId",
       "interactionMode",
       "intercept",
+      "interestForElement",
       "interfaceClass",
       "interfaceName",
       "interfaceNumber",
@@ -30070,6 +30554,7 @@ var terser = (function (exports) {
       "isEnabled",
       "isEqual",
       "isEqualNode",
+      "isError",
       "isExtended",
       "isExtensible",
       "isExternalCTAP2SecurityKeySupported",
@@ -30193,6 +30678,7 @@ var terser = (function (exports) {
       "language",
       "languages",
       "largeArcFlag",
+      "last",
       "lastChild",
       "lastElementChild",
       "lastError",
@@ -30425,6 +30911,7 @@ var terser = (function (exports) {
       "math-depth",
       "math-style",
       "mathDepth",
+      "mathShift",
       "mathStyle",
       "matrix",
       "matrixTransform",
@@ -30487,6 +30974,7 @@ var terser = (function (exports) {
       "maxWidth",
       "maximumLatency",
       "measure",
+      "measureInputUsage",
       "measureText",
       "media",
       "mediaCapabilities",
@@ -30514,7 +31002,9 @@ var terser = (function (exports) {
       "method",
       "methodDetails",
       "methodName",
+      "microseconds",
       "mid",
+      "milliseconds",
       "mimeType",
       "mimeTypes",
       "min",
@@ -30534,6 +31024,8 @@ var terser = (function (exports) {
       "minValue",
       "minWidth",
       "minimumLatency",
+      "minute",
+      "minutes",
       "mipLevel",
       "mipLevelCount",
       "mipmapFilter",
@@ -30546,8 +31038,11 @@ var terser = (function (exports) {
       "model",
       "modify",
       "module",
+      "month",
+      "months",
       "mount",
       "move",
+      "moveBefore",
       "moveBy",
       "moveEnd",
       "moveFirst",
@@ -30811,6 +31306,7 @@ var terser = (function (exports) {
       "names",
       "namespaceURI",
       "namespaces",
+      "nanoseconds",
       "nativeApplication",
       "nativeMap",
       "nativeObjectCreate",
@@ -30881,6 +31377,8 @@ var terser = (function (exports) {
       "numberOfItems",
       "numberOfOutputs",
       "numberValue",
+      "numberingSystem",
+      "numeric",
       "oMatchesSelector",
       "object",
       "object-fit",
@@ -30891,6 +31389,7 @@ var terser = (function (exports) {
       "objectStoreNames",
       "objectType",
       "observe",
+      "observedAttributes",
       "occlusionQuerySet",
       "of",
       "off",
@@ -31021,6 +31520,7 @@ var terser = (function (exports) {
       "onclick",
       "onclose",
       "onclosing",
+      "oncommand",
       "oncompassneedscalibration",
       "oncomplete",
       "oncompositionend",
@@ -31058,6 +31558,7 @@ var terser = (function (exports) {
       "ondisplay",
       "ondispose",
       "ondownloading",
+      "ondownloadprogress",
       "ondrag",
       "ondragend",
       "ondragenter",
@@ -31334,6 +31835,7 @@ var terser = (function (exports) {
       "onwebkittransitionend",
       "onwheel",
       "onzoom",
+      "onzoomlevelchange",
       "opacity",
       "open",
       "openCursor",
@@ -31369,6 +31871,7 @@ var terser = (function (exports) {
       "originAgentCluster",
       "originalPolicy",
       "originalTarget",
+      "ornaments",
       "orphans",
       "os",
       "oscpu",
@@ -31389,8 +31892,10 @@ var terser = (function (exports) {
       "outlineWidth",
       "outputBuffer",
       "outputChannelCount",
+      "outputLanguage",
       "outputLatency",
       "outputs",
+      "overallProgress",
       "overflow",
       "overflow-anchor",
       "overflow-block",
@@ -31479,6 +31984,7 @@ var terser = (function (exports) {
       "paint-order",
       "paintOrder",
       "paintRequests",
+      "paintTime",
       "paintType",
       "paintWorklet",
       "palette",
@@ -31520,6 +32026,7 @@ var terser = (function (exports) {
       "patternUnits",
       "pause",
       "pauseAnimations",
+      "pauseDepthSensing",
       "pauseDuration",
       "pauseOnExit",
       "pauseProfilers",
@@ -31552,6 +32059,8 @@ var terser = (function (exports) {
       "phoneticFamilyName",
       "phoneticGivenName",
       "photo",
+      "phrase",
+      "phrases",
       "pictureInPictureChild",
       "pictureInPictureElement",
       "pictureInPictureEnabled",
@@ -31562,6 +32071,7 @@ var terser = (function (exports) {
       "pitch",
       "pixelBottom",
       "pixelDepth",
+      "pixelFormat",
       "pixelHeight",
       "pixelLeft",
       "pixelRight",
@@ -31632,6 +32142,9 @@ var terser = (function (exports) {
       "positionAlign",
       "positionAnchor",
       "positionArea",
+      "positionTry",
+      "positionTryFallbacks",
+      "positionVisibility",
       "positionX",
       "positionY",
       "positionZ",
@@ -31658,6 +32171,7 @@ var terser = (function (exports) {
       "presentation",
       "presentationArea",
       "presentationStyle",
+      "presentationTime",
       "preserveAlpha",
       "preserveAspectRatio",
       "preserveAspectRatioString",
@@ -31696,6 +32210,7 @@ var terser = (function (exports) {
       "probeSpace",
       "process",
       "processIceMessage",
+      "processLocally",
       "processingEnd",
       "processingStart",
       "processorOptions",
@@ -31708,6 +32223,7 @@ var terser = (function (exports) {
       "profiles",
       "projectionMatrix",
       "promise",
+      "promising",
       "prompt",
       "properties",
       "propertyIsEnumerable",
@@ -31752,6 +32268,7 @@ var terser = (function (exports) {
       "querySet",
       "queue",
       "queueMicrotask",
+      "quota",
       "quote",
       "quotes",
       "r",
@@ -31930,6 +32447,7 @@ var terser = (function (exports) {
       "reportError",
       "reportEvent",
       "reportId",
+      "reportOnly",
       "reportValidity",
       "request",
       "requestAdapter",
@@ -31965,6 +32483,7 @@ var terser = (function (exports) {
       "requestVideoFrameCallback",
       "requestViewportScale",
       "requestWindow",
+      "requested",
       "requestingWindow",
       "requireInteraction",
       "required",
@@ -31975,6 +32494,7 @@ var terser = (function (exports) {
       "resetLatency",
       "resetPose",
       "resetTransform",
+      "resetZoomLevel",
       "resizable",
       "resize",
       "resizeBy",
@@ -31999,14 +32519,17 @@ var terser = (function (exports) {
       "restartAfterDelay",
       "restartIce",
       "restore",
+      "restrictTo",
       "result",
       "resultIndex",
       "resultType",
       "results",
       "resume",
+      "resumeDepthSensing",
       "resumeProfilers",
       "resumeTransformFeedback",
       "retry",
+      "returnType",
       "returnValue",
       "rev",
       "reverse",
@@ -32203,14 +32726,18 @@ var terser = (function (exports) {
       "searchBox",
       "searchBoxJavaBridge_",
       "searchParams",
+      "second",
+      "seconds",
       "sectionRowIndex",
       "secureConnectionStart",
+      "securePaymentConfirmationAvailability",
       "security",
       "seed",
       "seek",
       "seekToNextFrame",
       "seekable",
       "seeking",
+      "segments",
       "select",
       "selectAllChildren",
       "selectAlternateInterface",
@@ -32345,6 +32872,7 @@ var terser = (function (exports) {
       "setPaint",
       "setParameter",
       "setParameters",
+      "setPathData",
       "setPeriodicWave",
       "setPipeline",
       "setPointerCapture",
@@ -32443,6 +32971,7 @@ var terser = (function (exports) {
       "shapeOutside",
       "shapeRendering",
       "share",
+      "sharedContext",
       "sharedStorage",
       "sharedStorageWritable",
       "sheet",
@@ -32467,6 +32996,9 @@ var terser = (function (exports) {
       "sidebarAction",
       "sign",
       "signal",
+      "signalAllAcceptedCredentials",
+      "signalCurrentUserDetails",
+      "signalUnknownCredential",
       "signalingState",
       "signature",
       "silent",
@@ -32508,9 +33040,11 @@ var terser = (function (exports) {
       "sourceBuffers",
       "sourceCapabilities",
       "sourceCharPosition",
+      "sourceElement",
       "sourceFile",
       "sourceFunctionName",
       "sourceIndex",
+      "sourceLanguage",
       "sourceMap",
       "sourceURL",
       "sources",
@@ -32651,8 +33185,12 @@ var terser = (function (exports) {
       "styleSheet",
       "styleSheetSets",
       "styleSheets",
+      "styleset",
+      "stylistic",
       "sub",
       "subarray",
+      "subgroupMaxSize",
+      "subgroupMinSize",
       "subject",
       "submit",
       "submitFrame",
@@ -32665,6 +33203,9 @@ var terser = (function (exports) {
       "subtree",
       "suffix",
       "suffixes",
+      "sumPrecise",
+      "summarize",
+      "summarizeStreaming",
       "summary",
       "sup",
       "supported",
@@ -32675,6 +33216,7 @@ var terser = (function (exports) {
       "supportsFiber",
       "supportsSession",
       "supportsText",
+      "suppressed",
       "surfaceScale",
       "surroundContents",
       "suspend",
@@ -32687,7 +33229,9 @@ var terser = (function (exports) {
       "svw",
       "swapCache",
       "swapNode",
+      "swash",
       "sweepFlag",
+      "switchMap",
       "symbols",
       "symmetricDifference",
       "sync",
@@ -32721,12 +33265,14 @@ var terser = (function (exports) {
       "take",
       "takePhoto",
       "takeRecords",
+      "takeUntil",
       "tan",
       "tangentialPressure",
       "tanh",
       "target",
       "targetAddressSpace",
       "targetElement",
+      "targetLanguage",
       "targetRayMode",
       "targetRaySpace",
       "targetTouches",
@@ -32785,6 +33331,7 @@ var terser = (function (exports) {
       "textDecoration",
       "textDecorationBlink",
       "textDecorationColor",
+      "textDecorationInset",
       "textDecorationLine",
       "textDecorationLineThrough",
       "textDecorationNone",
@@ -32829,6 +33376,9 @@ var terser = (function (exports) {
       "timeOrigin",
       "timeRemaining",
       "timeStamp",
+      "timeStyle",
+      "timeZone",
+      "timeZoneName",
       "timecode",
       "timeline",
       "timelineTime",
@@ -32875,6 +33425,7 @@ var terser = (function (exports) {
       "toString",
       "toStringTag",
       "toSum",
+      "toTemporalInstant",
       "toTimeString",
       "toUTCString",
       "toUpperCase",
@@ -32946,6 +33497,7 @@ var terser = (function (exports) {
       "transitionTimingFunction",
       "translate",
       "translateSelf",
+      "translateStreaming",
       "translationX",
       "translationY",
       "transport",
@@ -33094,6 +33646,7 @@ var terser = (function (exports) {
       "usbVersionMajor",
       "usbVersionMinor",
       "usbVersionSubminor",
+      "use",
       "useCurrentView",
       "useMap",
       "useProgram",
@@ -33101,6 +33654,7 @@ var terser = (function (exports) {
       "user-select",
       "userActivation",
       "userAgent",
+      "userAgentAllowsProtocol",
       "userAgentData",
       "userChoice",
       "userHandle",
@@ -33184,6 +33738,8 @@ var terser = (function (exports) {
       "viewTarget",
       "viewTargetString",
       "viewTransition",
+      "viewTransitionClass",
+      "viewTransitionName",
       "viewport",
       "viewportAnchorX",
       "viewportAnchorY",
@@ -33412,12 +33968,15 @@ var terser = (function (exports) {
       "webkitdirectory",
       "webkitdropzone",
       "webstore",
+      "weekday",
+      "weeks",
       "weight",
       "wgslLanguageFeatures",
       "whatToShow",
       "wheelDelta",
       "wheelDeltaX",
       "wheelDeltaY",
+      "when",
       "whenDefined",
       "which",
       "white-space",
@@ -33445,6 +34004,10 @@ var terser = (function (exports) {
       "wordBreak",
       "wordSpacing",
       "wordWrap",
+      "workerCacheLookupStart",
+      "workerFinalSourceType",
+      "workerMatchedSourceType",
+      "workerRouterEvaluationStart",
       "workerStart",
       "worklet",
       "wow64",
@@ -33483,12 +34046,15 @@ var terser = (function (exports) {
       "y2",
       "yChannelSelector",
       "yandex",
+      "year",
+      "years",
       "yield",
       "z",
       "z-index",
       "zIndex",
       "zoom",
       "zoomAndPan",
+      "zoomLevel",
       "zoomRectScreen",
   ];
 
